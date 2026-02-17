@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  nekretnine-scraper:
+    build: .
+    container_name: nekretnine_bot
+    volumes:
+      - .:/app
+    # PROVERI: Na slici se fajl zove nekretnine.rs.py
+    command: python nekretnine.rs.py 
+
+  oglasi-scraper:
+    build: .
+    container_name: oglasi_bot
+    volumes:
+      - .:/app
+    # PROVERI: Na slici se fajl zove oglasi_rs_scraper.py
+    command: python oglasi_rs_scraper.py
