@@ -1,18 +1,63 @@
 version: '3.8'
 
 services:
+
+  # ============================================================
+  # PostgreSQL baza podataka
+  # ============================================================
+  postgres:
+    image: postgres:15
+    container_name: real_estate_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: real_estate
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres123
+    ports:
+      - "5432:5432"              # Lokalni port:kontejner port
+    volumes:
+      - postgres_data:/var/lib/postgresql/data   # Perzistentni podaci
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql  # Auto-inicijalizacija
+
+  # ============================================================
+  # Scraper za nekretnine.rs
+  # ============================================================
   nekretnine-scraper:
     build: .
     container_name: nekretnine_bot
+    depends_on:
+      - postgres                 # Čeka da postgres bude spreman
+    environment:
+      DB_HOST: postgres          # Koristi ime servisa, ne localhost!
+      DB_PORT: 5432
+      DB_NAME: real_estate
+      DB_USER: postgres
+      DB_PASSWORD: postgres123
     volumes:
       - .:/app
-    # PROVERI: Na slici se fajl zove nekretnine.rs.py
-    command: python nekretnine.rs.py 
+    command: python scrapers/nekretnine_scraper.py
+    # restart: "no"              # Pokrenuti jednom, ne restartovati
 
+  # ============================================================
+  # Scraper za oglasi.rs
+  # ============================================================
   oglasi-scraper:
     build: .
     container_name: oglasi_bot
+    depends_on:
+      - postgres
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: real_estate
+      DB_USER: postgres
+      DB_PASSWORD: postgres123
     volumes:
       - .:/app
-    # PROVERI: Na slici se fajl zove oglasi_rs_scraper.py
-    command: python oglasi_rs_scraper.py
+    command: python scrapers/oglasi_scraper.py
+
+# ============================================================
+# Volumes — perzistentni podaci koji preživljavaju restart
+# ============================================================
+volumes:
+  postgres_data:
