@@ -1,20 +1,17 @@
 import asyncio
 import aiohttp
 from bs4 import BeautifulSoup
-from datetime import datetime
 import time
-import sqlite3
 import re
+from scd_utils import get_db_connection, upsert_ad_scd2, mark_removed_ads
 
-# --- PODEŠAVANJA ---
-DB_NAME = "nekretnine.rs_data.db"
-BATCH_SIZE = 100  # Koliko stranica obrađivati odjednom
+# --- SETTINGS ---
 MAX_CONCURRENT_REQUESTS = 5
 RETRY_COUNT = 3
 RETRY_DELAY = 5
-# --- KRAJ PODEŠAVANJA ---
+IZVOR = 'nekretnine.rs'
 
-# Cenovni opsezi za pretragu
+# Price ranges to cover all listings (site limits results per search)
 PRICE_RANGES = [
     (0, 50000),
     (50000, 75000),
@@ -35,7 +32,7 @@ PRICE_RANGES = [
     (425000, 450000),
     (450000, 475000),
     (475000, 500000),
-    (500000, 9999999)  # Sve ostalo
+    (500000, 9999999)
 ]
 
 BASE_URL = "https://www.nekretnine.rs/stambeni-objekti/izdavanje-prodaja/prodaja/cena/{min_price}_{max_price}/lista/po-stranici/20/stranica/{page}/"
@@ -44,89 +41,72 @@ HEADERS = {
 }
 
 
-def init_database():
-    """Kreira SQLite bazu i tabelu 'oglasi' ako ne postoje."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS oglasi (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            Naslov TEXT,
-            Cena TEXT,
-            Cena_po_m2 TEXT,
-            Lokacija TEXT,
-            Kvadratura TEXT,
-            Tip_stana TEXT,
-            Datum_oglasa TEXT,
-            URL TEXT,
-            Datum_preuzimanja TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
-    print(f"✔️  Baza podataka '{DB_NAME}' je spremna.")
+# --- DATA NORMALIZATION ---
+# HTML scraper returns everything as strings, PostgreSQL expects NUMERIC types
+
+def _parse_price(price_str: str):
+    """'123.456 €' → 123456.0"""
+    if not price_str or price_str == 'N/A':
+        return None
+    try:
+        cleaned = re.sub(r'[^\d,.]', '', price_str).replace('.', '').replace(',', '.')
+        return float(cleaned)
+    except (ValueError, AttributeError):
+        return None
 
 
-def save_to_database(data_list):
-    """Čuva SVE oglase u bazu, bez provere duplikata."""
-    if not data_list:
-        return 0
+def _parse_area(area_str: str):
+    """'75 m²' → 75.0"""
+    if not area_str or area_str == 'N/A':
+        return None
+    try:
+        match = re.search(r'[\d,.]+', area_str)
+        return float(match.group().replace(',', '.')) if match else None
+    except (ValueError, AttributeError):
+        return None
 
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
 
-    insert_query = '''
-        INSERT INTO oglasi (Naslov, Cena, Cena_po_m2, Lokacija, Kvadratura, Tip_stana, Datum_oglasa, URL, Datum_preuzimanja)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    '''
+def _extract_grad(lokacija: str):
+    """'Beograd, Novi Beograd, Blok 45' → 'Beograd'"""
+    if not lokacija or lokacija == 'N/A':
+        return None
+    return lokacija.split(',')[0].strip()
 
-    data_to_insert = [
-        (
-            oglas['Naslov'], oglas['Cena'], oglas['Cena_po_m2'], oglas['Lokacija'],
-            oglas['Kvadratura'], oglas['Tip_stana'], oglas['Datum_oglasa'], oglas['URL'],
-            datetime.now().date().isoformat()
-        )
-        for oglas in data_list
-    ]
 
-    cursor.executemany(insert_query, data_to_insert)
-    conn.commit()
-    conn.close()
-    return len(data_list)
-
+# --- HTML PARSING ---
 
 def parse_html_page(html_content):
+    """Parses one listing page, returns list of raw ad dicts."""
     soup = BeautifulSoup(html_content, 'lxml')
     oglasi = soup.find_all('div', class_='row offer')
     if not oglasi:
-        return []  # Nema oglasa = kraj stranica
+        return []
     page_data = []
 
     for oglas in oglasi:
         try:
-            # URL oglasa (NAJVAŽNIJE!)
             url_tag = oglas.find('a', href=re.compile(r'/stambeni-objekti/'))
             url = "https://www.nekretnine.rs" + url_tag['href'] if url_tag else 'N/A'
-            # Naslov
+
             naslov_tag = oglas.find('h2', class_='offer-title')
             naslov = naslov_tag.text.strip() if naslov_tag else 'N/A'
-            # Cena
+
             cena_tag = oglas.find('p', class_='offer-price')
             cena = 'N/A'
             if cena_tag:
                 cena_span = cena_tag.find('span')
                 if cena_span:
                     cena = cena_span.text.strip()
-            # Cena po m²
+
             cena_po_m2 = 'N/A'
             if cena_tag:
                 cena_m2_tag = cena_tag.find('small', class_='custom-offer-style')
                 if cena_m2_tag:
                     cena_po_m2 = cena_m2_tag.text.strip()
-            # Lokacija
+
             lokacija_tag = oglas.find('p', class_='offer-location')
             lokacija = lokacija_tag.text.strip() if lokacija_tag else 'N/A'
-            # Kvadratura
+
             kvadratura = 'N/A'
             kvadratura_tags = oglas.find_all('p', class_='offer-price')
             for tag in kvadratura_tags:
@@ -136,11 +116,9 @@ def parse_html_page(html_content):
                         kvadratura = span.text.strip()
                         break
 
-            # Meta info (Datum i Tip stana)
             meta_info_tag = oglas.find('div', class_='offer-meta-info')
             datum_oglasa = 'N/A'
             tip_stana = 'N/A'
-
             if meta_info_tag:
                 meta_text = meta_info_tag.text.strip()
                 parts = [p.strip() for p in meta_text.split('|')]
@@ -149,7 +127,7 @@ def parse_html_page(html_content):
                 if len(parts) >= 3:
                     tip_stana = parts[2].strip()
 
-            podaci_oglasa = {
+            page_data.append({
                 "Naslov": naslov,
                 "Cena": cena,
                 "Cena_po_m2": cena_po_m2,
@@ -158,101 +136,150 @@ def parse_html_page(html_content):
                 "Tip_stana": tip_stana,
                 "Datum_oglasa": datum_oglasa,
                 "URL": url
-            }
-
-            page_data.append(podaci_oglasa)
+            })
 
         except Exception as e:
-            print(f"   ⚠️  Greška pri parsiranju oglasa: {e}")
+            print(f"   ⚠️  Parsing error: {e}")
             continue
 
     return page_data
 
 
+# --- HTTP ---
+
 async def fetch_page(session, url, semaphore):
-    """Asinhrono preuzima stranicu sa retry logikom."""
+    """Fetches a single page with retry logic."""
     for attempt in range(RETRY_COUNT):
         async with semaphore:
             if attempt > 0:
-                print(f"   -> Ponovni pokušaj ({attempt + 1}/{RETRY_COUNT}) za {url}")
+                print(f"   -> Retry ({attempt + 1}/{RETRY_COUNT}) for {url}")
             try:
                 async with session.get(url, timeout=25) as response:
                     if response.status == 200:
                         return await response.text()
                     else:
-                        print(f"   ❌ Greška za {url}, Status: {response.status}. Pokušaj {attempt + 1}.")
+                        print(f"   ❌ Status {response.status} for {url}. Attempt {attempt + 1}.")
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                print(f"   🔥 Greška konekcije za {url} (pokušaj {attempt + 1}): {type(e).__name__}")
+                print(f"   🔥 Connection error for {url} (attempt {attempt + 1}): {type(e).__name__}")
 
         if attempt < RETRY_COUNT - 1:
             await asyncio.sleep(RETRY_DELAY)
 
-    print(f"   💀 Odustajem od {url} nakon {RETRY_COUNT} pokušaja.")
+    print(f"   💀 Giving up on {url} after {RETRY_COUNT} attempts.")
     return None
 
 
-async def process_price_range(session, semaphore, min_price, max_price):
-    """Obrađuje jedan cenovni opseg, stranica po stranica, sve dok ima oglasa."""
+# --- SCRAPING + SCD UPSERT ---
+
+async def process_price_range(session, semaphore, min_price, max_price,
+                               cursor, scraped_urls: list):
+    """
+    Scrapes all pages for one price range.
+    For each ad: normalizes data, calls SCD Type 2 upsert, tracks URL.
+    """
     print(f"\n{'=' * 60}")
-    print(f"💰 Počinjem obradu cenovnog opsega: {min_price:,} - {max_price:,} €")
+    print(f"💰 Price range: {min_price:,} - {max_price:,} €")
     print(f"{'=' * 60}")
 
     total_ads_in_range = 0
+    stats = {'inserted': 0, 'changed': 0, 'unchanged': 0}
     page = 1
 
     while True:
-        print(f"\n--- Stranica {page} (Cena: {min_price:,}-{max_price:,} €) ---")
+        print(f"\n--- Page {page} ({min_price:,}-{max_price:,} €) ---")
 
         url = BASE_URL.format(min_price=min_price, max_price=max_price, page=page)
         html = await fetch_page(session, url, semaphore)
 
         if not html:
-            print(f"   ⚠️  Nije moguće preuzeti stranicu {page}. Zaustavljam ovaj opseg.")
+            print(f"   ⚠️  Could not fetch page {page}. Stopping this range.")
             break
 
         ads_data = parse_html_page(html)
 
         if not ads_data:
-            print(f"   🛑 Nema oglasa na stranici {page}. Zaustavljam ovaj cenovni opseg.")
+            print(f"   🛑 No ads on page {page}. End of range.")
             break
 
-        print(f"   ✅ Pronađeno {len(ads_data)} oglasa na stranici {page}.")
-        added_count = save_to_database(ads_data)
-        total_ads_in_range += added_count
-        print(f"   💾 Sačuvano {added_count} oglasa u bazu.")
+        print(f"   ✅ Found {len(ads_data)} ads on page {page}.")
+
+        # Normalize each ad and run SCD Type 2 upsert
+        for ad in ads_data:
+            ad_normalized = {
+                'url':        ad['URL'],
+                'naslov':     ad['Naslov'],
+                'cena':       _parse_price(ad['Cena']),
+                'cena_po_m2': _parse_price(ad['Cena_po_m2']),
+                'lokacija':   ad['Lokacija'],
+                'grad':       _extract_grad(ad['Lokacija']),
+                'kvadratura': _parse_area(ad['Kvadratura']),
+                'tip_stana':  ad['Tip_stana'],
+                'sobnost':    None,  # not available on nekretnine.rs
+                'sprat':      None,  # not available on nekretnine.rs
+                'izvor':      IZVOR
+            }
+
+            result = upsert_ad_scd2(cursor, ad_normalized)
+            stats[result] += 1
+
+            if ad_normalized['url'] != 'N/A':
+                scraped_urls.append(ad_normalized['url'])
+
+        total_ads_in_range += len(ads_data)
+        print(f"   📊 Page stats: {stats}")
 
         page += 1
-
-        # Kratka pauza između stranica da ne opteretimo server
         await asyncio.sleep(0.5)
 
-    print(f"\n✅ Završeno za opseg {min_price:,}-{max_price:,} €. Ukupno: {total_ads_in_range} oglasa.")
+    print(f"\n✅ Range {min_price:,}-{max_price:,} € done. Total: {total_ads_in_range} ads.")
     return total_ads_in_range
 
 
+# --- MAIN ---
+
 async def main():
     start_time = time.time()
-    init_database()
 
-    print(f"🚀 Započinjem scraping sa nekretnine.rs")
-    print(f"📊 Broj cenovnih opsega: {len(PRICE_RANGES)}")
+    print(f"🚀 Starting nekretnine.rs scraper")
+    print(f"📊 Price ranges: {len(PRICE_RANGES)}")
 
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-    total_ads_all_ranges = 0
+    semaphore            = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    scraped_urls         = []  # collects all seen URLs for removed ad detection
+    total_ads_all_ranges = 0   # running total across all price ranges
 
-    async with aiohttp.ClientSession(headers=HEADERS) as session:
-        for min_price, max_price in PRICE_RANGES:
-            ads_count = await process_price_range(session, semaphore, min_price, max_price)
-            total_ads_all_ranges += ads_count
+    # Single PostgreSQL connection for the entire run
+    conn   = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
+            for min_price, max_price in PRICE_RANGES:
+                ads_count = await process_price_range(
+                    session, semaphore, min_price, max_price,
+                    cursor, scraped_urls
+                )
+                total_ads_all_ranges += ads_count
+                conn.commit()  # commit after each price range
+                print(f"💾 Committed range {min_price:,}-{max_price:,} €")
+
+        # Mark ads not seen today as removed (SCD Type 2 close)
+        removed = mark_removed_ads(cursor, scraped_urls, IZVOR)
+        conn.commit()
+        print(f"🗑️  Marked {removed} ads as removed")
+
+    except Exception as e:
+        conn.rollback()  # undo uncommitted changes on error
+        print(f"❌ Critical error: {e}")
+        raise
+    finally:
+        cursor.close()
+        conn.close()
 
     print("\n" + "=" * 60)
-    print("🏁 ZAVRŠENO PREUZIMANJE SVIH CENOVNIH OPSEGA 🏁")
+    print("🏁 SCRAPING COMPLETE")
     print("=" * 60)
-
-    print(f"\n🗃️  Ukupno dodato oglasa u bazu: {total_ads_all_ranges}")
-
-    end_time = time.time()
-    print(f"⏱️  Ukupno vreme izvršavanja: {end_time - start_time:.2f} sekundi.")
+    print(f"\n🗃️  Total ads processed: {total_ads_all_ranges}")
+    print(f"⏱️  Total time: {time.time() - start_time:.2f}s")
 
 
 if __name__ == "__main__":
