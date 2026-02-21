@@ -1,7 +1,44 @@
+version: '3.8'
+
+# ============================================================
+# YAML Anchor — zajednička konfiguracija za sve Airflow servise
+# Umesto da kopiramo iste environment varijable 3 puta,
+# definišemo ih jednom ovde i referenciramo sa <<: *airflow-common
+# ============================================================
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.8.1
+  environment:
+    # Airflow koristi PostgreSQL za čuvanje historije taskova i logova
+    # 'postgres' je ime servisa ispod — Docker ga koristi kao hostname
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres123@postgres/airflow
+    # LocalExecutor = pokreće taskove kao subprocese na istoj mašini
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    # Isključi primere DAG-ova koji dolaze uz Airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    # Kredencijali za našu real_estate bazu (koriste scrapers)
+    DB_HOST: postgres
+    DB_PORT: 5432
+    DB_NAME: real_estate
+    DB_USER: postgres
+    DB_PASSWORD: postgres123
+  volumes:
+    # DAG fajlovi — Airflow čita odavde
+    - ./airflow/dags:/opt/airflow/dags
+    # Logovi — možemo čitati lokalno
+    - ./airflow/logs:/opt/airflow/logs
+    # Plugins — prazno za sada ali Airflow očekuje folder
+    - ./airflow/plugins:/opt/airflow/plugins
+    # Scrapers — Airflow ih pokreće odavde
+    - ./scrapers:/opt/airflow/scrapers
+    # Python paketi potrebni za scrapers
+    - ./airflow/requirements.txt:/requirements.txt
+  depends_on:
+    - postgres
+
 services:
 
   # ============================================================
-  # PostgreSQL baza podataka
+  # PostgreSQL — čuva i real_estate podatke i Airflow metapodatke
   # ============================================================
   postgres:
     image: postgres:15
@@ -12,50 +49,65 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres123
     ports:
-      - "5432:5432"              # Lokalni port:kontejner port
+      - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data   # Perzistentni podaci
-      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql  # Auto-inicijalizacija
+      - postgres_data:/var/lib/postgresql/data
+      # init.sql kreira 'ads' tabelu (SCD Type 2)
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/01_init.sql
+      # create_airflow_db.sql kreira 'airflow' bazu za Airflow metapodatke
+      - ./sql/create_airflow_db.sql:/docker-entrypoint-initdb.d/02_create_airflow_db.sql
 
   # ============================================================
-  # Scraper za nekretnine.rs
+  # Airflow Init — pokreće se jednom, postavlja Airflow bazu
+  # i kreira admin korisnika, zatim se gasi (restart: no)
   # ============================================================
-  nekretnine-scraper:
-    build: .
-    container_name: nekretnine_bot
-    depends_on:
-      - postgres                 # Čeka da postgres bude spreman
-    environment:
-      DB_HOST: postgres          # Koristi ime servisa, ne localhost!
-      DB_PORT: 5432
-      DB_NAME: real_estate
-      DB_USER: postgres
-      DB_PASSWORD: postgres123
-    volumes:
-      - .:/app
-    command: python scrapers/nekretnine_scraper.py
-    # restart: "no"              # Pokrenuti jednom, ne restartovati
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow_init
+    command: >
+      bash -c "
+        pip install -r /requirements.txt &&
+        airflow db migrate &&
+        airflow users create
+          --username admin
+          --password admin
+          --firstname Admin
+          --lastname User
+          --role Admin
+          --email admin@example.com
+      "
+    restart: "no"
 
   # ============================================================
-  # Scraper za oglasi.rs
+  # Airflow Scheduler — mozak, pokreće taskove po rasporedu
+  # Čita DAG fajlove iz /opt/airflow/dags svakih 30 sekundi
   # ============================================================
-  oglasi-scraper:
-    build: .
-    container_name: oglasi_bot
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow_scheduler
+    command: bash -c "pip install -r /requirements.txt && airflow scheduler"
+    restart: unless-stopped
     depends_on:
       - postgres
-    environment:
-      DB_HOST: postgres
-      DB_PORT: 5432
-      DB_NAME: real_estate
-      DB_USER: postgres
-      DB_PASSWORD: postgres123
-    volumes:
-      - .:/app
-    command: python scrapers/oglasi_scraper.py
+      - airflow-init
+
+  # ============================================================
+  # Airflow Webserver — UI na http://localhost:8080
+  # Login: admin / admin
+  # ============================================================
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow_webserver
+    command: bash -c "pip install -r /requirements.txt && airflow webserver"
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+      - airflow-init
 
 # ============================================================
-# Volumes — perzistentni podaci koji preživljavaju restart
+# Volumes
 # ============================================================
 volumes:
   postgres_data:

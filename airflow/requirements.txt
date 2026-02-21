@@ -1,0 +1,4 @@
+psycopg2-binary
+aiohttp
+beautifulsoup4
+lxml
