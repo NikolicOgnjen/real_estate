@@ -12,8 +12,8 @@ CREATE TABLE IF NOT EXISTS ads (
 
     -- Data columns
     naslov      TEXT,
-    cena        NUMERIC(12, 2),
-    cena_po_m2  NUMERIC(10, 2),
+    cena        NUMERIC(20, 2),
+    cena_po_m2  NUMERIC(20, 2),
     lokacija    TEXT,
     grad        TEXT,
     kvadratura  NUMERIC(8, 2),
