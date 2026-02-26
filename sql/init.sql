@@ -89,13 +89,13 @@ BEGIN
     GROUP BY a.url
     HAVING COUNT(*) > 1;
 
-    -- Test 2: current row with valid_to set
+-- Test 2: current row with valid_to set
     RETURN QUERY
     SELECT 'CURRENT_WITH_END_DATE'::TEXT,
-           url,
-           'is_current=TRUE but valid_to=' || valid_to::TEXT AS details
-    FROM ads
-    WHERE is_current = TRUE AND valid_to IS NOT NULL;
+           a.url,
+           'is_current=TRUE but valid_to=' || a.valid_to::TEXT AS details
+    FROM ads a
+    WHERE a.is_current = TRUE AND a.valid_to IS NOT NULL;
 END;
 $$ LANGUAGE plpgsql;
 
